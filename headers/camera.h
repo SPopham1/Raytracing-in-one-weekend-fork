@@ -4,6 +4,12 @@
 #include "hittable.h"
 #include "pdf.h"
 #include "material.h"
+#include "denoiser.h"
+#include <vector>
+
+// Include stb_image_write for PNG export
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 class camera {
   public:
@@ -21,13 +27,27 @@ class camera {
     double defocus_angle = 0;  // Variation angle of rays through each pixel
     double focus_dist = 10;    // Distance from camera lookfrom point to plane of perfect focus
 
+    bool   denoise = false;    // Enable denoising post-processing
+    std::string denoise_mode = "bilateral";  // "bilateral", "median", or "fast"
+
     void render(const hittable& world, const hittable& lights) {
+        render_to_file("", world, lights);
+    }
+
+    void render_to_file(const std::string& filename, const hittable& world, const hittable& lights) {
         initialize();
 
+        // If filename provided, save as PNG
+        if (!filename.empty()) {
+            render_to_png(filename, world, lights);
+            return;
+        }
+
+        // Otherwise output PPM to stdout
         std::cout << "P3\n" << image_width << ' ' << image_height << "\n255\n";
 
         for (int j = 0; j < image_height; j++) {
-            std::clog << "\rScanlines remaining: " << (image_height - j) << ' ' << std::flush;
+            print_progress(j, image_height);
             for (int i = 0; i < image_width; i++) {
                 color pixel_color(0,0,0);
                 for (int s_j = 0; s_j < sqrt_spp; s_j++) {
@@ -41,6 +61,79 @@ class camera {
         }
 
         std::clog << "\rDone.                 \n";
+    }
+
+    void render_to_png(const std::string& filename, const hittable& world, const hittable& lights) {
+        initialize();
+
+        // First pass: render to color buffer for potential denoising
+        std::vector<color> color_buffer(image_width * image_height);
+
+        for (int j = 0; j < image_height; j++) {
+            print_progress(j, image_height);
+            for (int i = 0; i < image_width; i++) {
+                color pixel_color(0,0,0);
+                for (int s_j = 0; s_j < sqrt_spp; s_j++) {
+                    for (int s_i = 0; s_i < sqrt_spp; s_i++) {
+                        ray r = get_ray(i, j, s_i, s_j);
+                        pixel_color += ray_color(r, max_depth, world, lights);
+                    }
+                }
+                color_buffer[j * image_width + i] = pixel_samples_scale * pixel_color;
+            }
+        }
+
+        // Apply denoising if enabled
+        std::vector<color> final_buffer = color_buffer;
+        if (denoise) {
+            std::clog << "\nDenoising (" << denoise_mode << " filter)...\n";
+            if (denoise_mode == "bilateral") {
+                final_buffer = denoiser::bilateral_denoise(color_buffer, image_width, image_height, 1.5, 0.15);
+            } else if (denoise_mode == "median") {
+                final_buffer = denoiser::median_denoise(color_buffer, image_width, image_height, 5);
+            } else if (denoise_mode == "fast") {
+                final_buffer = denoiser::fast_denoise(color_buffer, image_width, image_height, 3, 0.08);
+            }
+        }
+
+        // Convert to PNG
+        std::vector<unsigned char> image(image_width * image_height * 3);
+        for (int j = 0; j < image_height; j++) {
+            for (int i = 0; i < image_width; i++) {
+                color pixel_color = final_buffer[j * image_width + i];
+                
+                // Convert to PNG pixel format (linear to gamma)
+                auto clamp_val = [](double x) { return x < 0 ? 0 : (x > 0.999 ? 0.999 : x); };
+                int r_val = int(256 * clamp_val(std::sqrt(pixel_color.x())));
+                int g_val = int(256 * clamp_val(std::sqrt(pixel_color.y())));
+                int b_val = int(256 * clamp_val(std::sqrt(pixel_color.z())));
+
+                int idx = (j * image_width + i) * 3;
+                image[idx]     = r_val;
+                image[idx + 1] = g_val;
+                image[idx + 2] = b_val;
+            }
+        }
+
+        if (stbi_write_png(filename.c_str(), image_width, image_height, 3, image.data(), image_width * 3)) {
+            std::clog << "Saved to: " << filename << "\n";
+        } else {
+            std::cerr << "Error: Failed to write PNG file " << filename << "\n";
+        }
+        std::clog << "\n";
+    }
+
+    void print_progress(int current, int total) {
+        int percent = (current * 100) / total;
+        int bar_width = 50;
+        int filled = (percent * bar_width) / 100;
+        
+        std::clog << "\r[";
+        for (int i = 0; i < bar_width; i++) {
+            if (i < filled) std::clog << "=";
+            else std::clog << "-";
+        }
+        std::clog << "] " << percent << "%" << std::flush;
     }
 
   private:
